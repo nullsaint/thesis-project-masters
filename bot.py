@@ -319,15 +319,7 @@ async def reset(ctx):
     """Force a total reset of all voice connections."""
     for vc in bot.voice_clients:
         await vc.disconnect(force=True)
-    await ctx.send("🔄 All voice connections forced to close. Try `!listen` in 5 seconds.")
-            await ctx.send("🔊 Audio stream started!")
-        else:
-            await ctx.send("ℹ️ I'm already playing the stream!")
-
-    except Exception as e:
-        full_error = traceback.format_exc()
-        print(f'\n[BOT] FULL ERROR:\n{full_error}')
-        await ctx.send(f"❌ Could not start audio: {e}")
+    await ctx.send("🔄 All voice connections forced to close. The bot will auto-join if audio is pushed, or you can try `!listen` in 5 seconds.")
 
 @bot.command()
 async def stop(ctx):
