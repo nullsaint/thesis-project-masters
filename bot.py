@@ -53,33 +53,50 @@ class AudioBuffer:
             self.last_data_time = time.time()
             self.connected = True
             
-        # 24/7 VAD Analysis (3-second window logic)
+        # LAZY JOIN: If we have data but aren't in voice, join now!
+        voice_client = voice_client_getter()
+        if not voice_client:
+            # We use a task to avoid blocking the HTTP receiver
+            bot.loop.create_task(self.auto_join_on_data())
+
+        # 24/7 VAD Analysis...
         try:
-            # We analyze the chunk we just received (typically 1024 bytes = 64ms)
             rms = audioop.rms(data, 2)
             self.voice_history.append(1 if rms > self.volume_threshold else 0)
             
             if sum(self.voice_history) >= self.required_voice_frames:
                 current_time = time.time()
                 if current_time - self.last_notify_time > self.notify_cooldown:
-                    # Check for human presence
                     humans_present = False
-                    voice_client = voice_client_getter()
                     if voice_client and voice_client.channel:
                         humans_present = any(not m.bot for m in voice_client.channel.members)
                     
                     if not humans_present:
-                        print(f"[VAD] 24/7 Monitor detected conversation! RMS: {rms}")
+                        print(f"[VAD] Conversation detected! RMS: {rms}")
                         self.last_notify_time = current_time
                         self.voice_history.clear()
-                        
                         channel = target_channel_getter()
                         if channel:
                             bot.loop.create_task(channel.send(
                                 "@everyone 🚨 **Conversation Detected by ESP32 Monitor!** Continuous talking identified!"
                             ))
-        except Exception as e:
+        except:
             pass
+
+    async def auto_join_on_data(self):
+        """Automatically join the first voice channel when data arrives."""
+        async with connection_lock:
+            if bot.voice_clients: return # Already joined
+            for guild in bot.guilds:
+                if guild.voice_channels:
+                    target = guild.voice_channels[0]
+                    text_out = guild.text_channels[0]
+                    print(f"[BOT] Audio data detected! Auto-joining {target.name}...")
+                    try:
+                        await join_and_play(text_out, target)
+                    except Exception as e:
+                        print(f"[BOT] Lazy join failed: {e}")
+                    return
 
     def read(self, num_bytes):
         with self.lock:
