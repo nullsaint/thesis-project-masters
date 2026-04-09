@@ -39,12 +39,47 @@ class AudioBuffer:
         self.lock = threading.Lock()
         self.connected = False
         self.last_data_time = 0
+        
+        # VAD State (Surveillance Window)
+        self.last_notify_time = 0
+        self.notify_cooldown = 15
+        self.volume_threshold = 500
+        self.voice_history = collections.deque(maxlen=150)
+        self.required_voice_frames = 50
 
-    def write(self, data):
+    def write(self, data, target_channel_getter, voice_client_getter):
         with self.lock:
             self.buffer.extend(data)
             self.last_data_time = time.time()
             self.connected = True
+            
+        # 24/7 VAD Analysis (3-second window logic)
+        try:
+            # We analyze the chunk we just received (typically 1024 bytes = 64ms)
+            rms = audioop.rms(data, 2)
+            self.voice_history.append(1 if rms > self.volume_threshold else 0)
+            
+            if sum(self.voice_history) >= self.required_voice_frames:
+                current_time = time.time()
+                if current_time - self.last_notify_time > self.notify_cooldown:
+                    # Check for human presence
+                    humans_present = False
+                    voice_client = voice_client_getter()
+                    if voice_client and voice_client.channel:
+                        humans_present = any(not m.bot for m in voice_client.channel.members)
+                    
+                    if not humans_present:
+                        print(f"[VAD] 24/7 Monitor detected conversation! RMS: {rms}")
+                        self.last_notify_time = current_time
+                        self.voice_history.clear()
+                        
+                        channel = target_channel_getter()
+                        if channel:
+                            bot.loop.create_task(channel.send(
+                                "@everyone 🚨 **Conversation Detected by ESP32 Monitor!** Continuous talking identified!"
+                            ))
+        except Exception as e:
+            pass
 
     def read(self, num_bytes):
         with self.lock:
@@ -106,10 +141,24 @@ async def handle_audio_stream_chunked(request):
         return web.Response(text="Unauthorized", status=401)
 
     print("[HTTP] ESP32 connected for streaming!")
+    
+    # Helper functions to get current channels for the VAD
+    def get_target_channel():
+        if NOTIFICATION_CHANNEL_ID and NOTIFICATION_CHANNEL_ID.isdigit():
+            return bot.get_channel(int(NOTIFICATION_CHANNEL_ID))
+        return None
+
+    def get_voice_client():
+        # This is a bit simplified; in a real bot we'd want to track which guild the ESP32 belongs to
+        # But for your thesis (1 bot, 1 server), this works!
+        if bot.voice_clients:
+            return bot.voice_clients[0]
+        return None
+
     try:
         async for chunk in request.content.iter_any():
             if chunk:
-                audio_buffer.write(chunk)
+                audio_buffer.write(chunk, get_target_channel, get_voice_client)
     except asyncio.CancelledError:
         pass
     except Exception as e:
@@ -146,13 +195,12 @@ class ESP32AudioSource(discord.AudioSource):
     def __init__(self, text_channel, voice_client):
         self.text_channel = text_channel
         self.voice_client = voice_client
+        # Cooldown and threshold settings moved to class level or init
         self.last_notify_time = 0
-        self.notify_cooldown = 15  # seconds between pings
-        self.volume_threshold = 500  # RMS threshold for voice detection
-
-        # Sliding window: 150 frames * 20ms = 3 seconds
+        self.notify_cooldown = 15 
+        self.volume_threshold = 500 
         self.voice_history = collections.deque(maxlen=150)
-        self.required_voice_frames = 50  # ~1 second of voice in 3s window
+        self.required_voice_frames = 50 
 
     def read(self):
         """
@@ -162,32 +210,9 @@ class ESP32AudioSource(discord.AudioSource):
         # 160 samples at 8kHz = 20ms of audio = 320 bytes
         esp32_data = audio_buffer.read(320)
 
-        # Analyze for voice activity BEFORE resampling
-        try:
-            rms = audioop.rms(esp32_data, 2)
-            self.voice_history.append(1 if rms > self.volume_threshold else 0)
-
-            if sum(self.voice_history) >= self.required_voice_frames:
-                current_time = time.time()
-                if current_time - self.last_notify_time > self.notify_cooldown:
-                    humans_present = False
-                    if self.voice_client and self.voice_client.channel:
-                        humans_present = any(not m.bot for m in self.voice_client.channel.members)
-
-                    if not humans_present:
-                        print(f"[VAD] Sustained conversation detected! RMS peak: {rms}")
-                        self.last_notify_time = current_time
-                        self.voice_history.clear()
-                        bot.loop.create_task(self.text_channel.send(
-                            "@everyone 🚨 **Conversation Detected by ESP32 Monitor!** Continuous talking identified!"
-                        ))
-        except Exception:
-            pass
-
-        # Resample: 8kHz 16-bit mono -> 48kHz 16-bit mono (multiply rate by 6)
-        try:
-            resampled, _ = audioop.ratecv(esp32_data, 2, 1, 8000, 48000, None)
-            return resampled
+        # Analysis now happens 24/7 in the AudioBuffer.write method
+        # for better surveillance coverage.
+        return resampled
         except Exception:
             # Return silence if resampling fails
             return bytes(3840)
