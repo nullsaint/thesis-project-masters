@@ -233,6 +233,17 @@ async def listen(ctx):
         elif voice_client.channel != channel:
             await voice_client.move_to(channel)
 
+        # Wait for the voice client to be fully connected before playing
+        # This prevents the "Not connected to voice" error
+        retry_count = 0
+        while not voice_client.is_connected() and retry_count < 50:
+            await asyncio.sleep(0.1)
+            retry_count += 1
+            
+        if not voice_client.is_connected():
+            await ctx.send("❌ Discord voice connection timed out. Please try `!listen` again.")
+            return
+
         esp_status = "🟢 CONNECTED" if audio_buffer.is_active() else "🟡 WAITING for ESP32 data..."
         await ctx.send(
             f"🎙️ Joined **{channel.name}**.\n"
@@ -251,10 +262,14 @@ async def listen(ctx):
         audio_source = ESP32AudioSource(target_channel, voice_client)
 
         if not voice_client.is_playing():
+            print(f"[BOT] Starting playback in {channel.name}...")
             voice_client.play(
                 audio_source,
-                after=lambda e: print(f'[BOT] Player error: {e}') if e else None
+                after=lambda e: print(f'[BOT] Player stopped: {e}') if e else None
             )
+            await ctx.send("🔊 Audio stream started!")
+        else:
+            await ctx.send("ℹ️ I'm already playing the stream!")
 
     except Exception as e:
         full_error = traceback.format_exc()
