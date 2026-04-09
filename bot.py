@@ -224,10 +224,13 @@ class ESP32AudioSource(discord.AudioSource):
 # ==========================================
 # BOT EVENTS & COMMANDS
 # ==========================================
+# Global lock to prevent multiple simultaneous connection attempts
+connection_lock = asyncio.Lock()
+
 @bot.event
 async def on_ready():
     print(f'[BOT] Logged in as {bot.user}')
-    print(f'[BOT] Commands: !listen, !stop, !status')
+    print(f'[BOT] Commands: !listen, !stop, !status, !reset')
 
     # ZOMBIE KILLER: Force disconnect any hanging sessions on startup
     for vc in bot.voice_clients:
@@ -236,87 +239,87 @@ async def on_ready():
             await vc.disconnect(force=True)
         except:
             pass
-
-    # Try importing voice support
-    try:
-        import discord.voice_client as vc
-        print(f'[BOT] Voice (PyNaCl) support: {vc.has_nacl}')
-    except Exception:
-        print('[BOT] Warning: Could not check PyNaCl status')
-
+    
     # Start the HTTP server for receiving ESP32 audio
     await start_http_server()
+    
+    # AUTO-JOIN: Try to join the first available voice channel on startup
+    # This reduces the need for user commands and prevents race conditions
+    await asyncio.sleep(5) # Give it a moment to stabilize
+    for guild in bot.guilds:
+        if guild.voice_channels:
+            target = guild.voice_channels[0]
+            print(f"[BOT] Attempting Auto-Join to {target.name}...")
+            # We use a fake context or just call the logic
+            try:
+                # Find a text channel for logs
+                text_channel = guild.text_channels[0]
+                await join_and_play(text_channel, target)
+            except Exception as e:
+                print(f"[BOT] Auto-join failed: {e}")
+
+async def join_and_play(text_channel, voice_channel):
+    """Core logic for joining and starting the stream with total stability."""
+    async with connection_lock:
+        try:
+            # 1. Force cleanup
+            existing_vc = discord.utils.get(bot.voice_clients, guild=voice_channel.guild)
+            if existing_vc:
+                await existing_vc.disconnect(force=True)
+                await asyncio.sleep(2)
+
+            # 2. Connect
+            print(f"[BOT] Connecting to {voice_channel.name}...")
+            vc = await voice_channel.connect(timeout=30.0, reconnect=True)
+            
+            # 3. Wait for the audio handshake (UDP)
+            try:
+                await asyncio.wait_for(vc.wait_until_ready(), timeout=15.0)
+            except asyncio.TimeoutError:
+                print("[BOT] Handshake timeout, proceeding anyway...")
+
+            # 4. Start streaming
+            audio_source = ESP32AudioSource(text_channel, vc)
+            if not vc.is_playing():
+                vc.play(audio_source, after=lambda e: print(f'[BOT] Player error: {e}') if e else None)
+                print(f"[BOT] Stream started in {voice_channel.name}")
+                return True
+        except Exception as e:
+            print(f"[BOT] join_and_play error: {type(e).__name__}: {e}")
+            raise e
+    return False
 
 @bot.command()
 async def listen(ctx):
     """Join a voice channel and start monitoring ESP32 audio."""
-    # Find a voice channel to join
+    if connection_lock.locked():
+        await ctx.send("⏳ I am already connecting! Please wait 10 seconds.")
+        return
+
     if ctx.author.voice:
         channel = ctx.author.voice.channel
     else:
         if ctx.guild.voice_channels:
             channel = ctx.guild.voice_channels[0]
         else:
-            await ctx.send("❌ No voice channels found in the server!")
+            await ctx.send("❌ No voice channels found!")
             return
 
+    await ctx.send(f"📡 Attempting to join **{channel.name}** and start 24/7 surveillance...")
     try:
-        # 1. Cleanup ANY existing voice connection in this guild FIRST
-        if ctx.voice_client:
-            print("[BOT] Cleaning up existing voice session...")
-            await ctx.voice_client.disconnect(force=True)
-            await asyncio.sleep(2)
+        success = await join_and_play(ctx.channel, channel)
+        if success:
+            esp_status = "🟢 CONNECTED" if audio_buffer.is_active() else "🟡 WAITING for ESP32 data..."
+            await ctx.send(f"✅ **Surveillance ACTIVE** in {channel.name}\nESP32: {esp_status}")
+    except Exception as e:
+        await ctx.send(f"❌ Connection failed: `{type(e).__name__}: {e}`")
 
-        # 2. Aggressive Connect
-        print(f"[BOT] Attempting connection to {channel.name}...")
-        try:
-            voice_client = await channel.connect(timeout=30.0, reconnect=True)
-        except Exception as e:
-            await ctx.send(f"❌ Initial connection failed: {e}. Retrying once...")
-            await asyncio.sleep(2)
-            voice_client = await channel.connect(timeout=30.0, reconnect=True)
-
-        # 3. Wait for readiness with manual retry
-        print(f"[BOT] Waiting for audio handshake...")
-        ready = False
-        for i in range(5):
-            if voice_client.is_connected() and voice_client.ws and voice_client.ws.is_connected():
-                ready = True
-                break
-            await asyncio.sleep(2)
-
-        if not ready:
-            print("[BOT] Handshake failed, trying manual wait_until_ready...")
-            try:
-                await asyncio.wait_for(voice_client.wait_until_ready(), timeout=10.0)
-            except:
-                pass # Proceed anyway, sometimes it's ready but the flag is slow
-
-        print(f"[BOT] Proceeding with stream in {channel.name}...")
-
-        esp_status = "🟢 CONNECTED" if audio_buffer.is_active() else "🟡 WAITING for ESP32 data..."
-        await ctx.send(
-            f"🎙️ Joined **{channel.name}**.\n"
-            f"📡 ESP32 Status: {esp_status}\n"
-            f"Surveillance Mode: **24/7 ACTIVE**\n"
-            f"🔊 Audio stream starting..."
-        )
-
-        # Set up notification target channel
-        target_channel = ctx.channel
-        if NOTIFICATION_CHANNEL_ID and NOTIFICATION_CHANNEL_ID.isdigit():
-            fetched_channel = bot.get_channel(int(NOTIFICATION_CHANNEL_ID))
-            if fetched_channel:
-                target_channel = fetched_channel
-
-        # Create the audio source that reads from the ESP32 buffer
-        audio_source = ESP32AudioSource(target_channel, voice_client)
-
-        if not voice_client.is_playing():
-            voice_client.play(
-                audio_source,
-                after=lambda e: print(f'[BOT] Player stopped: {e}') if e else None
-            )
+@bot.command()
+async def reset(ctx):
+    """Force a total reset of all voice connections."""
+    for vc in bot.voice_clients:
+        await vc.disconnect(force=True)
+    await ctx.send("🔄 All voice connections forced to close. Try `!listen` in 5 seconds.")
             await ctx.send("🔊 Audio stream started!")
         else:
             await ctx.send("ℹ️ I'm already playing the stream!")
