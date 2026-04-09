@@ -253,28 +253,30 @@ async def listen(ctx):
             return
 
     try:
-        voice_client = ctx.voice_client
-        if not voice_client:
-            voice_client = await channel.connect()
-        elif voice_client.channel != channel:
-            await voice_client.move_to(channel)
+        # 1. Cleanup old connections to prevent 4017/4006 errors
+        if ctx.voice_client:
+            print("[BOT] Cleaning up existing voice session...")
+            await ctx.voice_client.disconnect(force=True)
+            await asyncio.sleep(1)
 
-        # Wait for the voice client to be fully connected before playing
-        # This prevents the "Not connected to voice" error
-        retry_count = 0
-        while not voice_client.is_connected() and retry_count < 50:
-            await asyncio.sleep(0.1)
-            retry_count += 1
-            
-        if not voice_client.is_connected():
-            await ctx.send("❌ Discord voice connection timed out. Please try `!listen` again.")
+        # 2. Connect and wait for the OFFICIAL "Ready" state (UDP handshake)
+        print(f"[BOT] Connecting to {channel.name}...")
+        voice_client = await channel.connect(timeout=20.0, reconnect=True)
+        
+        try:
+            await asyncio.wait_for(voice_client.wait_until_ready(), timeout=15.0)
+        except asyncio.TimeoutError:
+            await ctx.send("❌ Discord audio handshake timed out. High latency or server issue. Try again.")
+            await voice_client.disconnect(force=True)
             return
+
+        print(f"[BOT] Voice connection fully ready in {channel.name}")
 
         esp_status = "🟢 CONNECTED" if audio_buffer.is_active() else "🟡 WAITING for ESP32 data..."
         await ctx.send(
             f"🎙️ Joined **{channel.name}**.\n"
             f"📡 ESP32 Status: {esp_status}\n"
-            f"Discord Krisp Noise Suppression applies automatically!"
+            f"Discord Krisp Noise Suppression applies automatically!\n🔊 Audio stream starting..."
         )
 
         # Set up notification target channel
