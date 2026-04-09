@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: esp32-discord-bot
+    runtime: docker
+    plan: free
+    envVars:
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: NOTIFICATION_CHANNEL_ID
+        sync: false
+      - key: ESP32_AUTH_KEY
+        sync: false
+      - key: PORT
+        value: 10000
