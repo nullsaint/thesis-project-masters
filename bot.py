@@ -210,9 +210,10 @@ class ESP32AudioSource(discord.AudioSource):
         # 160 samples at 8kHz = 20ms of audio = 320 bytes
         esp32_data = audio_buffer.read(320)
 
-        # Analysis now happens 24/7 in the AudioBuffer.write method
-        # for better surveillance coverage.
-        return resampled
+        # Resample: 8kHz 16-bit mono -> 48kHz 16-bit mono (multiply rate by 6)
+        try:
+            resampled, _ = audioop.ratecv(esp32_data, 2, 1, 8000, 48000, None)
+            return resampled
         except Exception:
             # Return silence if resampling fails
             return bytes(3840)
