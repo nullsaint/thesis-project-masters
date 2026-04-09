@@ -289,11 +289,12 @@ async def join_and_play(text_channel, voice_channel):
             print(f"[BOT] Connecting to {voice_channel.name}...")
             vc = await voice_channel.connect(timeout=30.0, reconnect=True)
             
-            # 3. Wait for the audio handshake (UDP)
-            try:
-                await asyncio.wait_for(vc.wait_until_ready(), timeout=15.0)
-            except asyncio.TimeoutError:
-                print("[BOT] Handshake timeout, proceeding anyway...")
+            # 3. Wait for the audio handshake to stabilize
+            print("[BOT] Waiting for audio handshake...")
+            for i in range(10):
+                if vc.is_connected():
+                    break
+                await asyncio.sleep(0.5)
 
             # 4. Start streaming
             audio_source = ESP32AudioSource(text_channel, vc)
