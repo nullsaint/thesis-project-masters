@@ -1,10 +1,11 @@
 FROM python:3.11-slim
 
-# Install system dependencies for PyNaCl and audio processing
+# Install system dependencies for PyNaCl, audio processing, and FFmpeg for stability
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     libsodium-dev \
     libffi-dev \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

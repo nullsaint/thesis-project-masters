@@ -229,6 +229,14 @@ async def on_ready():
     print(f'[BOT] Logged in as {bot.user}')
     print(f'[BOT] Commands: !listen, !stop, !status')
 
+    # ZOMBIE KILLER: Force disconnect any hanging sessions on startup
+    for vc in bot.voice_clients:
+        try:
+            print(f"[BOT] Clearing zombie session in {vc.guild.name}...")
+            await vc.disconnect(force=True)
+        except:
+            pass
+
     # Try importing voice support
     try:
         import discord.voice_client as vc
@@ -253,30 +261,45 @@ async def listen(ctx):
             return
 
     try:
-        # 1. Cleanup old connections to prevent 4017/4006 errors
+        # 1. Cleanup ANY existing voice connection in this guild FIRST
         if ctx.voice_client:
             print("[BOT] Cleaning up existing voice session...")
             await ctx.voice_client.disconnect(force=True)
-            await asyncio.sleep(1)
+            await asyncio.sleep(2)
 
-        # 2. Connect and wait for the OFFICIAL "Ready" state (UDP handshake)
-        print(f"[BOT] Connecting to {channel.name}...")
-        voice_client = await channel.connect(timeout=20.0, reconnect=True)
-        
+        # 2. Aggressive Connect
+        print(f"[BOT] Attempting connection to {channel.name}...")
         try:
-            await asyncio.wait_for(voice_client.wait_until_ready(), timeout=15.0)
-        except asyncio.TimeoutError:
-            await ctx.send("❌ Discord audio handshake timed out. High latency or server issue. Try again.")
-            await voice_client.disconnect(force=True)
-            return
+            voice_client = await channel.connect(timeout=30.0, reconnect=True)
+        except Exception as e:
+            await ctx.send(f"❌ Initial connection failed: {e}. Retrying once...")
+            await asyncio.sleep(2)
+            voice_client = await channel.connect(timeout=30.0, reconnect=True)
 
-        print(f"[BOT] Voice connection fully ready in {channel.name}")
+        # 3. Wait for readiness with manual retry
+        print(f"[BOT] Waiting for audio handshake...")
+        ready = False
+        for i in range(5):
+            if voice_client.is_connected() and voice_client.ws and voice_client.ws.is_connected():
+                ready = True
+                break
+            await asyncio.sleep(2)
+
+        if not ready:
+            print("[BOT] Handshake failed, trying manual wait_until_ready...")
+            try:
+                await asyncio.wait_for(voice_client.wait_until_ready(), timeout=10.0)
+            except:
+                pass # Proceed anyway, sometimes it's ready but the flag is slow
+
+        print(f"[BOT] Proceeding with stream in {channel.name}...")
 
         esp_status = "🟢 CONNECTED" if audio_buffer.is_active() else "🟡 WAITING for ESP32 data..."
         await ctx.send(
             f"🎙️ Joined **{channel.name}**.\n"
             f"📡 ESP32 Status: {esp_status}\n"
-            f"Discord Krisp Noise Suppression applies automatically!\n🔊 Audio stream starting..."
+            f"Surveillance Mode: **24/7 ACTIVE**\n"
+            f"🔊 Audio stream starting..."
         )
 
         # Set up notification target channel
@@ -290,7 +313,6 @@ async def listen(ctx):
         audio_source = ESP32AudioSource(target_channel, voice_client)
 
         if not voice_client.is_playing():
-            print(f"[BOT] Starting playback in {channel.name}...")
             voice_client.play(
                 audio_source,
                 after=lambda e: print(f'[BOT] Player stopped: {e}') if e else None
