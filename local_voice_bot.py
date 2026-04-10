@@ -24,7 +24,6 @@ import audioop
 import aiohttp
 import os
 import wave
-import struct
 import collections
 import threading
 import datetime
@@ -44,7 +43,8 @@ ESP32_AUTH_KEY = os.getenv('ESP32_AUTH_KEY', 'esp32secret')
 RENDER_RELAY_URL = "https://thesis-project-masters.onrender.com/relay"
 
 # Poll Render every N seconds for audio chunks
-POLL_INTERVAL = 0.9  # Just under 1 second to keep buffer flowing
+# 2s interval prevents overwhelming Render's free tier
+POLL_INTERVAL = 2.0
 
 # Recording settings
 # On Android/Termux, change this to: Path('/sdcard/recordings')
@@ -173,7 +173,7 @@ async def poll_render():
                 async with session.get(
                     RENDER_RELAY_URL,
                     headers={"X-Auth-Key": ESP32_AUTH_KEY},
-                    timeout=aiohttp.ClientTimeout(total=5)
+                    timeout=aiohttp.ClientTimeout(total=15)
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.read()
@@ -181,9 +181,12 @@ async def poll_render():
                             # Path 1: feed Discord voice buffer
                             local_buffer.write(data)
                             # Path 2: save to WAV file (parallel, non-blocking)
-                            await asyncio.get_event_loop().run_in_executor(
-                                None, recorder.write, data
-                            )
+                            try:
+                                await asyncio.get_running_loop().run_in_executor(
+                                    None, recorder.write, data
+                                )
+                            except Exception as rec_err:
+                                print(f"[REC] Write error: {rec_err}")
                             print(f"[RELAY] {len(data)}B received | Buffer: {local_buffer.size()}B")
             except Exception as e:
                 print(f"[RELAY] Poll error: {e}")
@@ -211,15 +214,19 @@ async def auto_join_watchdog():
     global _voice_client
     await asyncio.sleep(10)
     while True:
-        if local_buffer.size() > 5000:  # ~0.3s of audio buffered — ESP32 is live
-            if not _voice_client or not _voice_client.is_connected():
-                print("[WATCHDOG] Audio buffered. Auto-joining voice...")
-                await connect_voice()
-            elif not _voice_client.is_playing():
-                _voice_client.play(
-                    RelayAudioSource(),
-                    after=lambda e: print(f"[BOT] Playback ended: {e}") if e else None
-                )
+        try:
+            if local_buffer.size() > 5000:  # ~0.3s of audio buffered — ESP32 is live
+                if not _voice_client or not _voice_client.is_connected():
+                    print("[WATCHDOG] Audio buffered. Auto-joining voice...")
+                    await connect_voice()
+                elif not _voice_client.is_playing():
+                    print("[WATCHDOG] Connected but not playing. Restarting stream...")
+                    _voice_client.play(
+                        RelayAudioSource(),
+                        after=lambda e: print(f"[BOT] Playback ended: {e}") if e else None
+                    )
+        except Exception as e:
+            print(f"[WATCHDOG] Error: {type(e).__name__}: {e}")
         await asyncio.sleep(10)
 
 async def connect_voice():
