@@ -1,17 +1,20 @@
 """
 local_voice_bot.py
 ==================
-Run this on your LOCAL MACHINE (laptop/PC).
+Run this on your LOCAL MACHINE (laptop/PC) or Android via Termux.
 
-It polls your Render cloud server for audio data, then plays it
-in Discord voice. This bypasses the Discord voice block on cloud IPs.
+Features:
+  - Polls Render cloud server for ESP32 audio
+  - Plays it live in Discord voice channel
+  - SIMULTANEOUSLY saves raw audio as WAV files (new file every hour)
+  - Works from any network — home, university, anywhere
 
 Usage:
     pip install discord.py aiohttp python-dotenv PyNaCl
     python local_voice_bot.py
 
-Works from ANY network — home, university, demo hall — without
-port forwarding. The Render server is the middleman for audio.
+On Android (Termux), recordings save to /sdcard/recordings/
+On Windows/Linux, recordings save to ./recordings/
 """
 
 import discord
@@ -20,8 +23,12 @@ import asyncio
 import audioop
 import aiohttp
 import os
+import wave
+import struct
 import collections
 import threading
+import datetime
+from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -38,6 +45,11 @@ RENDER_RELAY_URL = "https://thesis-project-masters.onrender.com/relay"
 
 # Poll Render every N seconds for audio chunks
 POLL_INTERVAL = 0.9  # Just under 1 second to keep buffer flowing
+
+# Recording settings
+# On Android/Termux, change this to: Path('/sdcard/recordings')
+RECORDINGS_DIR = Path('./recordings')
+NEW_FILE_EVERY_MINUTES = 60  # Start a new WAV file every hour
 
 # ==========================================
 # LOCAL AUDIO BUFFER
@@ -67,6 +79,67 @@ class LocalAudioBuffer:
 local_buffer = LocalAudioBuffer()
 
 # ==========================================
+# WAV RECORDER (runs in parallel)
+# ==========================================
+class WavRecorder:
+    """
+    Writes raw 8kHz 16-bit mono PCM to WAV files.
+    Creates a new file every hour automatically.
+    Thread-safe — can be written from the async polling loop.
+    """
+    def __init__(self, recordings_dir: Path):
+        self.dir = recordings_dir
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self._wav = None
+        self._file_start_time = None
+        self._lock = threading.Lock()
+        self._total_bytes = 0
+        self._open_new_file()
+
+    def _open_new_file(self):
+        """Open a new WAV file with current timestamp as filename."""
+        if self._wav:
+            self._wav.close()
+        now = datetime.datetime.now()
+        filename = self.dir / f"recording_{now.strftime('%Y-%m-%d_%H-%M-%S')}.wav"
+        self._wav = wave.open(str(filename), 'wb')
+        self._wav.setnchannels(1)        # Mono
+        self._wav.setsampwidth(2)        # 16-bit
+        self._wav.setframerate(8000)     # 8kHz (raw ESP32 rate)
+        self._file_start_time = now
+        self._total_bytes = 0
+        print(f"[REC] New recording: {filename.name}")
+
+    def write(self, data: bytes):
+        """Write audio data. Rotates file every hour automatically."""
+        with self._lock:
+            # Rotate file if time limit reached
+            elapsed = (datetime.datetime.now() - self._file_start_time).total_seconds()
+            if elapsed >= NEW_FILE_EVERY_MINUTES * 60:
+                self._open_new_file()
+            self._wav.writeframes(data)
+            self._total_bytes += len(data)
+
+    def get_stats(self):
+        """Return recording stats for the status command."""
+        with self._lock:
+            files = sorted(self.dir.glob('*.wav'))
+            total_size = sum(f.stat().st_size for f in files)
+            return len(files), total_size
+
+    def list_files(self):
+        """Return list of WAV files."""
+        with self._lock:
+            return sorted(self.dir.glob('*.wav'))
+
+    def close(self):
+        with self._lock:
+            if self._wav:
+                self._wav.close()
+
+recorder = WavRecorder(RECORDINGS_DIR)
+
+# ==========================================
 # DISCORD AUDIO SOURCE
 # ==========================================
 class RelayAudioSource(discord.AudioSource):
@@ -87,10 +160,13 @@ class RelayAudioSource(discord.AudioSource):
 # ==========================================
 async def poll_render():
     """
-    Continuously polls Render's /relay endpoint for audio chunks.
-    Runs in background — completely independent of Discord voice.
+    Polls Render's /relay endpoint for audio chunks.
+    SIMULTANEOUSLY:
+      1. Feeds the local audio buffer → Discord voice playback
+      2. Writes to WAV file on disk → persistent recording
     """
     print(f"[RELAY] Starting audio poll from: {RENDER_RELAY_URL}")
+    print(f"[REC]   Saving recordings to: {RECORDINGS_DIR.resolve()}")
     async with aiohttp.ClientSession() as session:
         while True:
             try:
@@ -102,8 +178,13 @@ async def poll_render():
                     if resp.status == 200:
                         data = await resp.read()
                         if data:
+                            # Path 1: feed Discord voice buffer
                             local_buffer.write(data)
-                            print(f"[RELAY] Got {len(data)} bytes | Buffer: {local_buffer.size()} bytes")
+                            # Path 2: save to WAV file (parallel, non-blocking)
+                            await asyncio.get_event_loop().run_in_executor(
+                                None, recorder.write, data
+                            )
+                            print(f"[RELAY] {len(data)}B received | Buffer: {local_buffer.size()}B")
             except Exception as e:
                 print(f"[RELAY] Poll error: {e}")
             await asyncio.sleep(POLL_INTERVAL)
@@ -207,17 +288,38 @@ async def stop(ctx):
 
 @bot.command()
 async def status(ctx):
-    """Show relay status."""
+    """Show relay and recording status."""
     buf = local_buffer.size()
     vc_ok = bool(_voice_client and _voice_client.is_connected())
     playing = bool(_voice_client and _voice_client.is_playing()) if vc_ok else False
+    num_files, total_size = recorder.get_stats()
+    size_mb = total_size / (1024 * 1024)
 
     embed = discord.Embed(title="📊 Local Relay Bot Status", color=0x00ff00 if vc_ok else 0xff9900)
     embed.add_field(name="Render Relay", value=f"📡 {RENDER_RELAY_URL}", inline=False)
     embed.add_field(name="Local Buffer", value=f"{buf} bytes {'🟢' if buf > 5000 else '🔴 (no ESP32 data)'}", inline=True)
     embed.add_field(name="Voice Channel", value="✅ Connected" if vc_ok else "❌ Not connected", inline=True)
     embed.add_field(name="Playing Audio", value="✅ Yes" if playing else "❌ No", inline=True)
+    embed.add_field(name="Recordings", value=f"📁 {num_files} files | {size_mb:.1f} MB", inline=False)
+    embed.add_field(name="Save Location", value=f"`{RECORDINGS_DIR.resolve()}`", inline=False)
     await ctx.send(embed=embed)
+
+@bot.command()
+async def recordings(ctx):
+    """List saved WAV recordings."""
+    files = recorder.list_files()
+    if not files:
+        await ctx.send("📁 No recordings yet. Start the ESP32 to begin recording.")
+        return
+    lines = []
+    for f in files[-10:]:  # Show last 10
+        size_kb = f.stat().st_size / 1024
+        # Estimate duration: 8000 samples/s * 2 bytes = 16000 bytes/s
+        duration_s = f.stat().st_size / 16000
+        lines.append(f"`{f.name}` — {size_kb:.0f} KB, ~{duration_s/60:.1f} min")
+    msg = f"📁 **Recordings** (last {len(lines)}):\n" + "\n".join(lines)
+    msg += f"\n\n📂 Saved to: `{RECORDINGS_DIR.resolve()}`"
+    await ctx.send(msg)
 
 # ==========================================
 # MAIN
