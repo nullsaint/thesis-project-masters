@@ -132,20 +132,31 @@ async def handle_health(request):
 
 async def handle_audio_stream(request):
     """
-    Receives raw PCM audio pushed from the ESP32.
-    ESP32 sends POST requests with raw audio bytes.
+    Receives raw PCM audio pushed from the ESP32 (1-second bursts).
+    ESP32 sends POST requests with raw audio bytes to /audio.
     """
     auth = request.headers.get('X-Auth-Key', '')
     if auth != ESP32_AUTH_KEY:
         return web.Response(text="Unauthorized", status=401)
 
+    def get_target_channel():
+        if NOTIFICATION_CHANNEL_ID and NOTIFICATION_CHANNEL_ID.isdigit():
+            return bot.get_channel(int(NOTIFICATION_CHANNEL_ID))
+        return None
+
+    def get_voice_client():
+        if bot.voice_clients:
+            return bot.voice_clients[0]
+        return None
+
     try:
         data = await request.read()
         if data:
-            audio_buffer.write(data)
+            print(f"[HTTP] Received audio burst: {len(data)} bytes")
+            audio_buffer.write(data, get_target_channel, get_voice_client)
         return web.Response(text="OK", status=200)
     except Exception as e:
-        print(f"Error receiving audio: {e}")
+        print(f"[HTTP] Error receiving audio: {e}")
         return web.Response(text="Error", status=500)
 
 async def handle_audio_stream_chunked(request):
