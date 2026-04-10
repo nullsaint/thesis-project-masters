@@ -1,13 +1,8 @@
 """
-Render Cloud Server - Pure HTTP Audio Relay
+Render Cloud Server - WebSocket Audio Relay
 ============================================
-This runs on Render.com. It does THREE things only:
-  1. Receives audio bursts from ESP32 via POST /audio
-  2. Serves audio to the local bot via GET /relay
-  3. Sends @everyone alerts via Discord Webhook (no bot token needed)
-
-NO discord.py. NO gateway connection. NO token conflicts.
-All Discord bot features (voice, commands) run in local_voice_bot.py.
+Runs on Render.com. Receives audio from ESP32 and pushes it
+in real-time to the local bot via WebSocket (no polling needed).
 """
 
 import os
@@ -22,71 +17,66 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ==========================================
-# CONFIGURATION
-# ==========================================
 ESP32_AUTH_KEY = os.getenv('ESP32_AUTH_KEY', 'esp32secret')
-DISCORD_WEBHOOK_URL = os.getenv('DISCORD_WEBHOOK_URL', '')  # Set this in Render env vars
+DISCORD_WEBHOOK_URL = os.getenv('DISCORD_WEBHOOK_URL', '')
 HTTP_PORT = int(os.getenv('PORT', '8080'))
 
 # ==========================================
-# SHARED AUDIO BUFFER
+# AUDIO BUFFER + VAD
 # ==========================================
 class AudioBuffer:
-    def __init__(self, max_size=512 * 1024):  # 512KB ~= 32 seconds at 8kHz
-        self.buffer = collections.deque(maxlen=max_size)
+    def __init__(self):
         self.lock = threading.Lock()
         self.last_data_time = 0
-
-        # VAD state
         self.last_notify_time = 0
         self.notify_cooldown = 15
         self.volume_threshold = 500
         self.voice_history = collections.deque(maxlen=150)
         self.required_voice_frames = 50
 
-    def write(self, data: bytes):
-        with self.lock:
-            self.buffer.extend(data)
-            self.last_data_time = time.time()
-
-        # VAD analysis
+    def analyze_vad(self, data: bytes):
         try:
             rms = audioop.rms(data, 2)
             self.voice_history.append(1 if rms > self.volume_threshold else 0)
-
             if sum(self.voice_history) >= self.required_voice_frames:
                 now = time.time()
                 if now - self.last_notify_time > self.notify_cooldown:
                     self.last_notify_time = now
                     self.voice_history.clear()
-                    print(f"[VAD] Conversation detected! RMS={rms}. Sending webhook alert.")
+                    print(f"[VAD] Conversation detected! RMS={rms}")
                     asyncio.get_event_loop().create_task(send_webhook_alert())
         except Exception:
             pass
 
-    def drain(self, max_bytes: int = 32000) -> bytes:
-        """Drain up to max_bytes for the local bot to consume."""
-        with self.lock:
-            available = min(max_bytes, len(self.buffer))
-            if available == 0:
-                return b''
-            return bytes([self.buffer.popleft() for _ in range(available)])
+    def mark_received(self):
+        self.last_data_time = time.time()
 
-    def is_active(self) -> bool:
+    def is_active(self):
         return (time.time() - self.last_data_time) < 5
-
-    def size(self) -> int:
-        return len(self.buffer)
 
 audio_buffer = AudioBuffer()
 
 # ==========================================
-# DISCORD WEBHOOK ALERT (no bot token needed)
+# WEBSOCKET RELAY CLIENTS
+# ==========================================
+ws_clients: set = set()
+
+async def broadcast(data: bytes):
+    """Push audio to all connected local bots instantly."""
+    dead = set()
+    for ws in list(ws_clients):
+        try:
+            await ws.send_bytes(data)
+        except Exception:
+            dead.add(ws)
+    ws_clients.difference_update(dead)
+
+# ==========================================
+# DISCORD WEBHOOK ALERT
 # ==========================================
 async def send_webhook_alert():
     if not DISCORD_WEBHOOK_URL:
-        print("[VAD] No webhook URL set. Skipping alert.")
+        print("[VAD] DISCORD_WEBHOOK_URL not set. Skipping alert.")
         return
     try:
         async with aiohttp.ClientSession() as session:
@@ -98,13 +88,13 @@ async def send_webhook_alert():
         print(f"[VAD] Webhook error: {e}")
 
 # ==========================================
-# HTTP ROUTES
+# HTTP + WEBSOCKET ROUTES
 # ==========================================
 async def handle_health(request):
+    clients = len(ws_clients)
     esp = "STREAMING" if audio_buffer.is_active() else "WAITING"
-    buf = audio_buffer.size()
     return web.Response(
-        text=f"Cloud relay server alive.\nESP32: {esp}\nBuffer: {buf} bytes",
+        text=f"OK | ESP32: {esp} | Relay clients: {clients}",
         status=200
     )
 
@@ -115,44 +105,53 @@ async def handle_audio(request):
     try:
         data = await request.read()
         if data:
-            audio_buffer.write(data)
-            print(f"[ESP32] Burst received: {len(data)} bytes | Total buffer: {audio_buffer.size()} bytes")
+            audio_buffer.mark_received()
+            audio_buffer.analyze_vad(data)
+            await broadcast(data)  # Push to local bot instantly
+            clients = len(ws_clients)
+            print(f"[ESP32] {len(data)} bytes | Relay clients: {clients}")
         return web.Response(text="OK", status=200)
     except Exception as e:
         print(f"[ESP32] Error: {e}")
         return web.Response(text="Error", status=500)
 
-async def handle_relay(request):
+async def handle_ws(request):
     """
-    Local bot polls this endpoint to get buffered audio.
-    Returns up to 32KB of audio, or empty body if nothing buffered.
+    WebSocket endpoint for the local bot.
+    Local bot connects here once, then receives audio pushed in real-time.
     """
-    if request.headers.get('X-Auth-Key', '') != ESP32_AUTH_KEY:
+    auth = request.headers.get('X-Auth-Key', '')
+    if auth != ESP32_AUTH_KEY:
         return web.Response(text="Unauthorized", status=401)
-    data = audio_buffer.drain(32000)
-    if data:
-        print(f"[RELAY] Serving {len(data)} bytes to local bot")
-    return web.Response(
-        body=data,
-        content_type='application/octet-stream',
-        status=200
-    )
 
-# ==========================================
-# SERVER STARTUP
-# ==========================================
+    ws = web.WebSocketResponse(heartbeat=30)
+    await ws.prepare(request)
+    ws_clients.add(ws)
+    print(f"[WS] Local bot connected! Total clients: {len(ws_clients)}")
+
+    try:
+        async for msg in ws:
+            pass  # Keep-alive — we only send, not receive
+    except Exception as e:
+        print(f"[WS] Client error: {e}")
+    finally:
+        ws_clients.discard(ws)
+        print(f"[WS] Local bot disconnected. Clients: {len(ws_clients)}")
+
+    return ws
+
 async def create_app():
     app = web.Application()
     app.router.add_get('/', handle_health)
     app.router.add_get('/health', handle_health)
     app.router.add_post('/audio', handle_audio)
-    app.router.add_post('/stream', handle_audio)  # backward compat alias
-    app.router.add_get('/relay', handle_relay)
+    app.router.add_post('/stream', handle_audio)
+    app.router.add_get('/ws', handle_ws)       # WebSocket for local bot
+    app.router.add_get('/relay', handle_health) # Keep old path alive (returns health now)
     return app
 
 if __name__ == '__main__':
-    print(f"[SERVER] Starting cloud relay server on port {HTTP_PORT}")
-    print(f"[SERVER] ESP32 → POST /audio")
-    print(f"[SERVER] Local bot → GET /relay")
-    print(f"[SERVER] Webhook alerts: {'ENABLED' if DISCORD_WEBHOOK_URL else 'DISABLED (set DISCORD_WEBHOOK_URL)'}")
+    print(f"[SERVER] Cloud relay starting on port {HTTP_PORT}")
+    print(f"[SERVER] ESP32  → POST /audio")
+    print(f"[SERVER] Local bot → WS  /ws")
     web.run_app(create_app(), port=HTTP_PORT)

@@ -1,20 +1,19 @@
 """
-local_voice_bot.py
-==================
-Run this on your LOCAL MACHINE (laptop/PC) or Android via Termux.
+local_voice_bot.py - Local Discord Voice Bot
+=============================================
+Run this on your laptop (or Android via Termux).
 
-Features:
-  - Polls Render cloud server for ESP32 audio
-  - Plays it live in Discord voice channel
-  - SIMULTANEOUSLY saves raw audio as WAV files (new file every hour)
-  - Works from any network — home, university, anywhere
+How it works:
+  1. Connects to Render via WebSocket (persistent, real-time)
+  2. Render pushes audio the INSTANT ESP32 sends it (no polling!)
+  3. Audio plays live in Discord voice channel
+  4. Audio saved to WAV files simultaneously
 
 Usage:
     pip install discord.py aiohttp python-dotenv PyNaCl
     python local_voice_bot.py
 
-On Android (Termux), recordings save to /sdcard/recordings/
-On Windows/Linux, recordings save to ./recordings/
+On Android (Termux): change RECORDINGS_DIR to Path('/sdcard/recordings')
 """
 
 import discord
@@ -38,159 +37,100 @@ load_dotenv()
 DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
 NOTIFICATION_CHANNEL_ID = os.getenv('NOTIFICATION_CHANNEL_ID')
 ESP32_AUTH_KEY = os.getenv('ESP32_AUTH_KEY', 'esp32secret')
+RENDER_WS_URL = "wss://thesis-project-masters.onrender.com/ws"
 
-# Your Render server URL
-RENDER_RELAY_URL = "https://thesis-project-masters.onrender.com/relay"
-
-# Poll Render every N seconds for audio chunks
-# 2s interval prevents overwhelming Render's free tier
-POLL_INTERVAL = 2.0
-
-# Recording settings
-# On Android/Termux, change this to: Path('/sdcard/recordings')
+# Recordings: change to Path('/sdcard/recordings') on Android
 RECORDINGS_DIR = Path('./recordings')
-NEW_FILE_EVERY_MINUTES = 60  # Start a new WAV file every hour
+NEW_FILE_EVERY_MINUTES = 60
 
 # ==========================================
 # LOCAL AUDIO BUFFER
 # ==========================================
-class LocalAudioBuffer:
+class LocalBuffer:
     def __init__(self, max_size=512*1024):
-        self.buffer = collections.deque(maxlen=max_size)
+        self.buf = collections.deque(maxlen=max_size)
         self.lock = threading.Lock()
+        self.last_write = 0
 
     def write(self, data: bytes):
         with self.lock:
-            self.buffer.extend(data)
+            self.buf.extend(data)
+            self.last_write = datetime.datetime.now().timestamp()
 
-    def read(self, num_bytes: int) -> bytes:
+    def read(self, n: int) -> bytes:
         with self.lock:
-            available = min(num_bytes, len(self.buffer))
-            if available == 0:
-                return bytes(num_bytes)  # silence
-            data = bytes([self.buffer.popleft() for _ in range(available)])
-            if len(data) < num_bytes:
-                data += bytes(num_bytes - len(data))
-            return data
+            avail = min(n, len(self.buf))
+            if avail == 0:
+                return bytes(n)
+            out = bytes([self.buf.popleft() for _ in range(avail)])
+            if len(out) < n:
+                out += bytes(n - len(out))
+            return out
 
-    def size(self):
-        return len(self.buffer)
+    def size(self) -> int:
+        return len(self.buf)
 
-local_buffer = LocalAudioBuffer()
+    def is_active(self) -> bool:
+        return (datetime.datetime.now().timestamp() - self.last_write) < 5
+
+local_buffer = LocalBuffer()
 
 # ==========================================
-# WAV RECORDER (runs in parallel)
+# WAV RECORDER
 # ==========================================
 class WavRecorder:
-    """
-    Writes raw 8kHz 16-bit mono PCM to WAV files.
-    Creates a new file every hour automatically.
-    Thread-safe — can be written from the async polling loop.
-    """
-    def __init__(self, recordings_dir: Path):
-        self.dir = recordings_dir
+    def __init__(self, directory: Path):
+        self.dir = directory
         self.dir.mkdir(parents=True, exist_ok=True)
         self._wav = None
-        self._file_start_time = None
+        self._start = None
         self._lock = threading.Lock()
-        self._total_bytes = 0
-        self._open_new_file()
+        self._open_new()
 
-    def _open_new_file(self):
-        """Open a new WAV file with current timestamp as filename."""
+    def _open_new(self):
         if self._wav:
             self._wav.close()
         now = datetime.datetime.now()
-        filename = self.dir / f"recording_{now.strftime('%Y-%m-%d_%H-%M-%S')}.wav"
-        self._wav = wave.open(str(filename), 'wb')
-        self._wav.setnchannels(1)        # Mono
-        self._wav.setsampwidth(2)        # 16-bit
-        self._wav.setframerate(8000)     # 8kHz (raw ESP32 rate)
-        self._file_start_time = now
-        self._total_bytes = 0
-        print(f"[REC] New recording: {filename.name}")
+        path = self.dir / f"rec_{now.strftime('%Y-%m-%d_%H-%M-%S')}.wav"
+        self._wav = wave.open(str(path), 'wb')
+        self._wav.setnchannels(1)
+        self._wav.setsampwidth(2)
+        self._wav.setframerate(8000)
+        self._start = now
+        print(f"[REC] New file: {path.name}")
 
     def write(self, data: bytes):
-        """Write audio data. Rotates file every hour automatically."""
         with self._lock:
-            # Rotate file if time limit reached
-            elapsed = (datetime.datetime.now() - self._file_start_time).total_seconds()
+            elapsed = (datetime.datetime.now() - self._start).total_seconds()
             if elapsed >= NEW_FILE_EVERY_MINUTES * 60:
-                self._open_new_file()
+                self._open_new()
             self._wav.writeframes(data)
-            self._total_bytes += len(data)
 
-    def get_stats(self):
-        """Return recording stats for the status command."""
-        with self._lock:
-            files = sorted(self.dir.glob('*.wav'))
-            total_size = sum(f.stat().st_size for f in files)
-            return len(files), total_size
+    def stats(self):
+        files = sorted(self.dir.glob('*.wav'))
+        total = sum(f.stat().st_size for f in files)
+        return len(files), total / (1024*1024)
 
-    def list_files(self):
-        """Return list of WAV files."""
-        with self._lock:
-            return sorted(self.dir.glob('*.wav'))
-
-    def close(self):
-        with self._lock:
-            if self._wav:
-                self._wav.close()
+    def list_recent(self, n=10):
+        return sorted(self.dir.glob('*.wav'))[-n:]
 
 recorder = WavRecorder(RECORDINGS_DIR)
 
 # ==========================================
 # DISCORD AUDIO SOURCE
 # ==========================================
-class RelayAudioSource(discord.AudioSource):
-    """Reads from local buffer and resamples 8kHz → 48kHz for Discord."""
+class ESP32AudioSource(discord.AudioSource):
+    """Reads 8kHz PCM from buffer, resamples to 48kHz for Discord."""
     def read(self):
-        raw = local_buffer.read(320)  # 160 samples @ 8kHz = 20ms
+        raw = local_buffer.read(320)
         try:
-            resampled, _ = audioop.ratecv(raw, 2, 1, 8000, 48000, None)
-            return resampled
+            out, _ = audioop.ratecv(raw, 2, 1, 8000, 48000, None)
+            return out
         except Exception:
-            return bytes(3840)  # silence
+            return bytes(3840)
 
     def cleanup(self):
         pass
-
-# ==========================================
-# RENDER POLLING TASK
-# ==========================================
-async def poll_render():
-    """
-    Polls Render's /relay endpoint for audio chunks.
-    SIMULTANEOUSLY:
-      1. Feeds the local audio buffer → Discord voice playback
-      2. Writes to WAV file on disk → persistent recording
-    """
-    print(f"[RELAY] Starting audio poll from: {RENDER_RELAY_URL}")
-    print(f"[REC]   Saving recordings to: {RECORDINGS_DIR.resolve()}")
-    async with aiohttp.ClientSession() as session:
-        while True:
-            try:
-                async with session.get(
-                    RENDER_RELAY_URL,
-                    headers={"X-Auth-Key": ESP32_AUTH_KEY},
-                    timeout=aiohttp.ClientTimeout(total=15)
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.read()
-                        if data:
-                            # Path 1: feed Discord voice buffer
-                            local_buffer.write(data)
-                            # Path 2: save to WAV file (parallel, non-blocking)
-                            try:
-                                await asyncio.get_running_loop().run_in_executor(
-                                    None, recorder.write, data
-                                )
-                            except Exception as rec_err:
-                                print(f"[REC] Write error: {rec_err}")
-                            print(f"[RELAY] {len(data)}B received | Buffer: {local_buffer.size()}B")
-            except Exception as e:
-                print(f"[RELAY] Poll error: {e}")
-            await asyncio.sleep(POLL_INTERVAL)
 
 # ==========================================
 # BOT SETUP
@@ -199,143 +139,192 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-_voice_client = None
+_vc = None          # Active voice client
+_joining = False    # Guard against concurrent joins
 
-@bot.event
-async def on_ready():
-    print(f"[BOT] Local relay bot online as {bot.user}")
-    print(f"[BOT] Polling Render for audio every {POLL_INTERVAL}s")
-    # Start polling Render for audio immediately
-    bot.loop.create_task(poll_render())
-    bot.loop.create_task(auto_join_watchdog())
-
-async def auto_join_watchdog():
-    """Joins voice automatically once audio is flowing from Render."""
-    global _voice_client
-    await asyncio.sleep(10)
+# ==========================================
+# WEBSOCKET CONNECTION TO RENDER
+# ==========================================
+async def render_ws_loop():
+    """
+    Maintains a persistent WebSocket connection to Render.
+    Render pushes audio the instant ESP32 sends it.
+    Auto-reconnects forever.
+    """
+    global _vc
+    print(f"[WS] Connecting to {RENDER_WS_URL}")
     while True:
         try:
-            if local_buffer.size() > 5000:  # ~0.3s of audio buffered — ESP32 is live
-                if not _voice_client or not _voice_client.is_connected():
-                    print("[WATCHDOG] Audio buffered. Auto-joining voice...")
-                    await connect_voice()
-                elif not _voice_client.is_playing():
-                    print("[WATCHDOG] Connected but not playing. Restarting stream...")
-                    _voice_client.play(
-                        RelayAudioSource(),
-                        after=lambda e: print(f"[BOT] Playback ended: {e}") if e else None
-                    )
-        except Exception as e:
-            print(f"[WATCHDOG] Error: {type(e).__name__}: {e}")
-        await asyncio.sleep(10)
+            async with aiohttp.ClientSession() as session:
+                async with session.ws_connect(
+                    RENDER_WS_URL,
+                    headers={'X-Auth-Key': ESP32_AUTH_KEY},
+                    heartbeat=20,
+                    timeout=aiohttp.ClientTimeout(total=None)  # No timeout — stays open
+                ) as ws:
+                    print("[WS] ✅ Connected to Render! Audio will stream in real-time.")
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.BINARY:
+                            data = msg.data
+                            # Feed Discord voice buffer
+                            local_buffer.write(data)
+                            # Save to WAV (non-blocking)
+                            try:
+                                loop = asyncio.get_running_loop()
+                                await loop.run_in_executor(None, recorder.write, data)
+                            except Exception:
+                                pass
+                            # Auto-join voice if we have audio and aren't connected
+                            if not _vc or not _vc.is_connected():
+                                asyncio.get_running_loop().create_task(auto_join())
 
-async def connect_voice():
-    global _voice_client
+                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                            print(f"[WS] Connection closed: {msg.type}")
+                            break
+
+        except Exception as e:
+            print(f"[WS] Disconnected ({type(e).__name__}). Reconnecting in 5s...")
+        await asyncio.sleep(5)
+
+async def auto_join():
+    """Join voice automatically when audio starts flowing."""
+    global _vc, _joining
+    if _joining or (_vc and _vc.is_connected() and _vc.is_playing()):
+        return
+    _joining = True
+    try:
+        await connect_voice()
+    finally:
+        _joining = False
+
+async def connect_voice() -> bool:
+    global _vc
     guild = next(iter(bot.guilds), None)
     if not guild or not guild.voice_channels:
-        print("[BOT] No voice channel found.")
         return False
-
     channel = guild.voice_channels[0]
+
     try:
-        if _voice_client:
-            await _voice_client.disconnect(force=True)
-            _voice_client = None
+        # Clean up old connection
+        if _vc:
+            await _vc.disconnect(force=True)
+            _vc = None
             await asyncio.sleep(1)
 
         print(f"[BOT] Connecting to {channel.name}...")
-        _voice_client = await channel.connect(timeout=30.0, reconnect=True)
+        _vc = await channel.connect(timeout=30.0, reconnect=True)
 
-        # Wait for connection
+        # Wait for UDP handshake
         for _ in range(20):
-            if _voice_client.is_connected():
+            if _vc.is_connected():
                 break
             await asyncio.sleep(0.25)
 
-        if not _voice_client.is_connected():
-            print("[BOT] Connection timed out.")
+        if not _vc.is_connected():
+            print("[BOT] Timed out waiting for voice connection.")
             return False
 
-        _voice_client.play(
-            RelayAudioSource(),
-            after=lambda e: print(f"[BOT] Playback ended: {e}") if e else None
+        _vc.play(
+            ESP32AudioSource(),
+            after=lambda e: print(f"[BOT] Stream ended: {e}") if e else None
         )
-        print(f"[BOT] ✅ Streaming audio in {channel.name}")
+        print(f"[BOT] ✅ Streaming in {channel.name}")
         return True
 
     except Exception as e:
         print(f"[BOT] Voice error: {type(e).__name__}: {e}")
-        _voice_client = None
+        _vc = None
         return False
+
+# ==========================================
+# BOT EVENTS
+# ==========================================
+@bot.event
+async def on_ready():
+    print(f"[BOT] Online as {bot.user}")
+    print(f"[BOT] Connecting to Render WebSocket...")
+    bot.loop.create_task(render_ws_loop())
 
 # ==========================================
 # COMMANDS
 # ==========================================
 @bot.command()
 async def listen(ctx):
-    """Join voice and start relaying ESP32 audio."""
-    await ctx.send("🎙️ Connecting...")
-    success = await connect_voice()
-    if success:
-        buf = local_buffer.size()
-        await ctx.send(f"✅ Connected! Buffer: {buf} bytes {'🟢' if buf > 1000 else '🟡 (waiting for ESP32)'}")
+    """Join the voice channel."""
+    global _vc
+    await ctx.send("🎙️ Connecting to voice...")
+    if _vc:
+        await _vc.disconnect(force=True)
+        _vc = None
+        await asyncio.sleep(1)
+    ok = await connect_voice()
+    if ok:
+        active = "🟢 Audio flowing!" if local_buffer.is_active() else "🟡 Waiting for ESP32..."
+        await ctx.send(f"✅ Connected! {active}")
     else:
-        await ctx.send("❌ Failed. Is the bot token correct? Check your terminal.")
+        await ctx.send("❌ Failed. Check terminal for error details.")
 
 @bot.command()
 async def stop(ctx):
-    """Leave voice channel."""
-    global _voice_client
-    if _voice_client:
-        await _voice_client.disconnect(force=True)
-        _voice_client = None
-        await ctx.send("🛑 Disconnected.")
+    """Leave the voice channel."""
+    global _vc
+    if _vc:
+        await _vc.disconnect(force=True)
+        _vc = None
+        await ctx.send("🛑 Left voice channel.")
     else:
-        await ctx.send("Not connected.")
+        await ctx.send("Not in a voice channel.")
 
 @bot.command()
 async def status(ctx):
-    """Show relay and recording status."""
+    """Show full system status."""
+    n_files, size_mb = recorder.stats()
     buf = local_buffer.size()
-    vc_ok = bool(_voice_client and _voice_client.is_connected())
-    playing = bool(_voice_client and _voice_client.is_playing()) if vc_ok else False
-    num_files, total_size = recorder.get_stats()
-    size_mb = total_size / (1024 * 1024)
+    vc_ok = bool(_vc and _vc.is_connected())
+    playing = bool(_vc and _vc.is_playing()) if vc_ok else False
+    ws_active = local_buffer.is_active()
 
-    embed = discord.Embed(title="📊 Local Relay Bot Status", color=0x00ff00 if vc_ok else 0xff9900)
-    embed.add_field(name="Render Relay", value=f"📡 {RENDER_RELAY_URL}", inline=False)
-    embed.add_field(name="Local Buffer", value=f"{buf} bytes {'🟢' if buf > 5000 else '🔴 (no ESP32 data)'}", inline=True)
+    embed = discord.Embed(
+        title="📊 ESP32 Surveillance Status",
+        color=0x00ff00 if (vc_ok and ws_active) else 0xff9900
+    )
+    embed.add_field(name="Render WebSocket", value="🟢 Audio flowing" if ws_active else "🔴 No data (ESP32 off?)", inline=False)
+    embed.add_field(name="Local Buffer", value=f"{buf} bytes", inline=True)
     embed.add_field(name="Voice Channel", value="✅ Connected" if vc_ok else "❌ Not connected", inline=True)
     embed.add_field(name="Playing Audio", value="✅ Yes" if playing else "❌ No", inline=True)
-    embed.add_field(name="Recordings", value=f"📁 {num_files} files | {size_mb:.1f} MB", inline=False)
-    embed.add_field(name="Save Location", value=f"`{RECORDINGS_DIR.resolve()}`", inline=False)
+    embed.add_field(name="Recordings", value=f"📁 {n_files} files | {size_mb:.1f} MB", inline=True)
+    embed.add_field(name="Save Path", value=f"`{RECORDINGS_DIR.resolve()}`", inline=False)
     await ctx.send(embed=embed)
 
 @bot.command()
 async def recordings(ctx):
-    """List saved WAV recordings."""
-    files = recorder.list_files()
+    """List recent WAV recordings."""
+    files = recorder.list_recent()
     if not files:
-        await ctx.send("📁 No recordings yet. Start the ESP32 to begin recording.")
+        await ctx.send("📁 No recordings yet.")
         return
     lines = []
-    for f in files[-10:]:  # Show last 10
-        size_kb = f.stat().st_size / 1024
-        # Estimate duration: 8000 samples/s * 2 bytes = 16000 bytes/s
-        duration_s = f.stat().st_size / 16000
-        lines.append(f"`{f.name}` — {size_kb:.0f} KB, ~{duration_s/60:.1f} min")
-    msg = f"📁 **Recordings** (last {len(lines)}):\n" + "\n".join(lines)
-    msg += f"\n\n📂 Saved to: `{RECORDINGS_DIR.resolve()}`"
-    await ctx.send(msg)
+    for f in files:
+        kb = f.stat().st_size / 1024
+        mins = f.stat().st_size / 16000 / 60
+        lines.append(f"`{f.name}` — {kb:.0f} KB (~{mins:.1f} min)")
+    await ctx.send("📁 **Recent Recordings:**\n" + "\n".join(lines))
+
+@bot.command()
+async def reset(ctx):
+    """Force disconnect and let watchdog reconnect."""
+    global _vc
+    if _vc:
+        await _vc.disconnect(force=True)
+        _vc = None
+    await ctx.send("🔄 Reset. Will auto-reconnect when Render sends audio.")
 
 # ==========================================
 # MAIN
 # ==========================================
-if __name__ == "__main__":
+if __name__ == '__main__':
     if not DISCORD_BOT_TOKEN:
-        print("[ERROR] DISCORD_BOT_TOKEN not set in .env!")
-        print("Create a .env file with: DISCORD_BOT_TOKEN=your_token_here")
+        print("[ERROR] DISCORD_BOT_TOKEN not in .env!")
     else:
-        print("[BOT] Starting LOCAL relay bot...")
-        print(f"[BOT] Will poll: {RENDER_RELAY_URL}")
+        print("[BOT] Starting local voice bot...")
         bot.run(DISCORD_BOT_TOKEN)
